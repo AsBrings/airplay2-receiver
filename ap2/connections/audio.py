@@ -427,6 +427,7 @@ class Audio:
             control_conns=None,
             isDebug=False,
             aud_params: AudioSetup = None,
+            ptp_clock_array=None,
     ):
         self.isDebug = isDebug
         self.addr = addr
@@ -449,14 +450,23 @@ class Audio:
         self.senderRtpTimestamp, self.playAtRtpTimestamp = None, None
         self.remoteClockMonotonic_ts, self.remoteClockId = None, None
 
+        # PTP disciplined clock (shared Array; may be untouched / unsynced).
+        self._ptp_clock_array = ptp_clock_array
+        self._ptp_clock = None  # lazily built in the audio process
+
     def init_audio_sink(self):
         codecLatencySec = 0
         self.pa = pyaudio.PyAudio()
+        # PyAudio frames_per_buffer of 4 (the upstream default) is far too
+        # small on Windows: WASAPI/WDM scheduling can't service that and the
+        # output stream underruns continuously, producing crackle/zipper
+        # noise. Use 1024 frames (~23 ms at 44.1 kHz) which matches the
+        # AirPlay packet cadence and keeps latency low.
         self.sink = self.pa.open(format=self.pa.get_format_from_width(2),
                                  channels=self.channel_count,
                                  rate=self.sample_rate,
                                  output=True,
-                                 frames_per_buffer=4,
+                                 frames_per_buffer=1024,
                                  )
         # nice Python3 crash if we don't check self.sink is null. Not harmful, but should check.
         if not self.sink:
@@ -500,7 +510,13 @@ class Audio:
         if self.codec is not None:
             self.codecContext = av.codec.CodecContext.create(self.codec)
             self.codecContext.sample_rate = self.sample_rate
-            self.codecContext.channels = self.channel_count
+            # PyAV >= 14 made `channels` read-only; set via `layout` instead.
+            # AirPlay 2 audio is stereo or mono; mono comes through as the
+            # `_1` suffix on the AirplayAudFmt enum (channel_count == 1).
+            if hasattr(self.codecContext, "layout"):
+                self.codecContext.layout = "mono" if self.channel_count == 1 else "stereo"
+            else:
+                self.codecContext.channels = self.channel_count
             self.codecContext.format = av.AudioFormat('s' + str(self.sample_size) + 'p')
         if ed is not None:
             self.codecContext.extradata = ed
@@ -517,9 +533,62 @@ class Audio:
         self.audio_screen_logger.debug(f"audioDevicelatency (sec): {audioDevicelatency:0.5f}")
         pyAudioDelay = self.sink.get_output_latency()
         self.audio_screen_logger.debug(f"pyAudioDelay (sec): {pyAudioDelay:0.5f}")
-        ptpDelay = 0.002
+        # PTP path delay: pulled from the disciplined clock if synced;
+        # otherwise fall back to the historical 2 ms guess.
+        ptpDelay = self._get_ptp_path_delay_sec()
         self.sample_delay = pyAudioDelay + audioDevicelatency + codecLatencySec + ptpDelay
-        self.audio_screen_logger.info(f"Total sample_delay (sec): {self.sample_delay:0.5f}")
+        self.audio_screen_logger.info(
+            f"Total sample_delay (sec): {self.sample_delay:0.5f} (ptp_path_delay={ptpDelay*1000:.3f}ms)"
+        )
+
+    def _ensure_ptp_clock(self):
+        """Bind the shared Array to a PTPDisciplinedClock view (lazy, since
+        the audio process can't construct it until it starts)."""
+        if self._ptp_clock is None and self._ptp_clock_array is not None:
+            from .ptp_clock import PTPDisciplinedClock
+            self._ptp_clock = PTPDisciplinedClock(self._ptp_clock_array)
+        return self._ptp_clock
+
+    def _get_ptp_path_delay_sec(self) -> float:
+        clk = self._ensure_ptp_clock()
+        if clk is not None and clk.is_synced():
+            return clk.get_mean_path_delay_ns() * 1e-9
+        return 0.002
+
+    def _ptp_now_ns(self) -> int:
+        """Local perf_counter expressed in disciplined master-clock domain
+        when synced; otherwise local perf_counter as a fallback (the same
+        epoch the rest of this module uses for anchor capture)."""
+        from .ptp_clock import now_local_ns
+        clk = self._ensure_ptp_clock()
+        if clk is not None and clk.is_synced():
+            return clk.now_master_ns()
+        return now_local_ns()
+
+    def _wait_for_ptp_sync(self, timeout_sec: float = 1.5) -> bool:
+        """Block briefly for the PTP slave to acquire first lock. Returns
+        True if synced before the timeout, False otherwise. Used right
+        before capturing the play-start anchor so the anchor lands in
+        master domain when possible."""
+        clk = self._ensure_ptp_clock()
+        if clk is None:
+            return False
+        if clk.is_synced():
+            return True
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            if clk.is_synced():
+                self.audio_screen_logger.info(
+                    f"PTP locked before playback: offset={clk.get_offset_ns()/1e6:+.3f}ms "
+                    f"mpd={clk.get_mean_path_delay_ns()/1e6:.3f}ms"
+                )
+                return True
+            time.sleep(0.05)
+        self.audio_screen_logger.warning(
+            "PTP did not acquire lock in time; anchoring with local clock "
+            "(playback will be coarsely synced until lock arrives)"
+        )
+        return False
 
     def decrypt(self, rtp):
         data = b''
@@ -568,11 +637,22 @@ class Audio:
         if(len(data) > 0):
             try:
                 for frame in self.codecContext.decode(packet):
-                    frame = self.resampler.resample(frame)
-                    if isinstance(frame, list):
-                        if len(frame) == 1: # if no resampling was needed, resample returns [frame]
-                            frame = frame[0]
-                    return bytes(frame.planes[0])
+                    out = self.resampler.resample(frame)
+                    if isinstance(out, list):
+                        if not out:
+                            continue
+                        out = out[0]
+                    # PyAV >= 14 may return planar layouts even when the
+                    # resampler is asked for a packed format; planes[0] would
+                    # then contain only channel 0, which PyAudio plays at the
+                    # wrong pitch with stereo gaps. Use to_ndarray() and
+                    # explicitly interleave so we always hand back packed
+                    # PCM regardless of the underlying frame layout.
+                    arr = out.to_ndarray()
+                    if arr.ndim == 2 and arr.shape[0] > 1:
+                        # planar (channels, samples) -> interleaved
+                        arr = arr.T.reshape(-1)
+                    return arr.tobytes()
             except ValueError as e:
                 self.audio_screen_logger.error(repr(e))
                 pass  # noqa
@@ -593,19 +673,24 @@ class Audio:
 
     def msec_to_playout(self, rtp_ts):
         """
-        msec until intended playout of RTP packet with timestamp rtp_ts
+        msec until intended playout of RTP packet with timestamp rtp_ts.
+
+        The "now" reading comes from the PTP-disciplined clock (master time
+        domain) when locked, falling back to local perf_counter when not.
+        anchorMonotonicNanosLocal is captured in the same domain so the
+        subtraction stays consistent across re-locks.
         """
         if not self.anchorRTPTimestamp:
             return 0
         rtp_ts_diff = rtp_ts - self.anchorRTPTimestamp
-        millis_to_anchor = int((time.monotonic_ns() - self.anchorMonotonicNanosLocal) * 1e-6)
+        millis_to_anchor = int((self._ptp_now_ns() - self.anchorMonotonicNanosLocal) * 1e-6)
         return int(1000 * rtp_ts_diff / self.sample_rate) - millis_to_anchor
 
     def msec_to_playout_with_outdev_delay(self, rtp_ts):
         return int(self.msec_to_playout(rtp_ts) - ((self.sample_delay * 1e3)))
 
     def samples_elapsed_since_anchor(self):
-        realtime_offset_sec = (time.monotonic_ns() - self.anchorMonotonicNanosLocal) * 1e-9
+        realtime_offset_sec = (self._ptp_now_ns() - self.anchorMonotonicNanosLocal) * 1e-9
         samples_to_playhead = self.anchorRTPTimestamp + realtime_offset_sec * self.sample_rate
         return samples_to_playhead
 
@@ -620,6 +705,7 @@ class Audio:
             control_conns=None,
             isDebug=False,
             aud_params: AudioSetup = None,
+            ptp_clock_array=None,
     ):
         audio = cls(
             addr,
@@ -630,6 +716,7 @@ class Audio:
             control_conns,
             isDebug,
             aud_params,
+            ptp_clock_array,
         )
         # This pipe is reachable from receiver
         rcvr_cmd_pipe, audio.command_chan = multiprocessing.Pipe()
@@ -652,7 +739,8 @@ class AudioRealtime(Audio):
             streamtype,
             control_conns=None,
             isDebug=False,
-            aud_params: AudioSetup = None
+            aud_params: AudioSetup = None,
+            ptp_clock_array=None,
     ):
         super(AudioRealtime, self).__init__(
             addr,
@@ -662,7 +750,8 @@ class AudioRealtime(Audio):
             streamtype,
             control_conns,
             isDebug,
-            aud_params
+            aud_params,
+            ptp_clock_array,
         )
         self.isDebug = isDebug
         self.socket = get_free_socket() if not addr else addr
@@ -752,7 +841,8 @@ class AudioRealtime(Audio):
                         else:
                             rtp = self.rtp_buffer.pop(0)
                             if starting:
-                                self.anchorMonotonicNanosLocal = time.monotonic_ns()
+                                self._wait_for_ptp_sync()
+                                self.anchorMonotonicNanosLocal = self._ptp_now_ns()
                                 starting = False
 
                         if rtp:
@@ -811,7 +901,8 @@ class AudioBuffered(Audio):
             streamtype=0,
             control_conns=None,
             isDebug=False,
-            aud_params: AudioSetup = None
+            aud_params: AudioSetup = None,
+            ptp_clock_array=None,
     ):
         super(AudioBuffered, self).__init__(
             addr,
@@ -822,6 +913,7 @@ class AudioBuffered(Audio):
             control_conns,
             isDebug,
             aud_params,
+            ptp_clock_array,
         )
         self.isDebug = isDebug
 
@@ -874,7 +966,8 @@ class AudioBuffered(Audio):
                     message = rtspconn.recv()
                     if isinstance(message, str):
                         if str.startswith(message, "play"):
-                            self.anchorMonotonicNanosLocal = time.monotonic_ns()
+                            self._wait_for_ptp_sync()
+                            self.anchorMonotonicNanosLocal = self._ptp_now_ns()
                             self.anchorRTPTimestamp = int(str.split(message, "-")[1])
                             playing = True
 
