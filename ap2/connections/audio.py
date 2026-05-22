@@ -556,38 +556,38 @@ class Audio:
         return 0.002
 
     def _ptp_now_ns(self) -> int:
-        """Local perf_counter expressed in disciplined master-clock domain
-        when synced; otherwise local perf_counter as a fallback (the same
-        epoch the rest of this module uses for anchor capture)."""
-        from .ptp_clock import now_local_ns
-        clk = self._ensure_ptp_clock()
-        if clk is not None and clk.is_synced():
-            return clk.now_master_ns()
-        return now_local_ns()
+        """Time source for the audio scheduler.
+
+        Originally returned the PTP-disciplined master time. In practice, on
+        Wi-Fi the disciplined clock occasionally steps (>100 ms) when the
+        servo sees outlier Sync samples; that step propagates into
+        msec_to_playout and stalls / desyncs single-receiver playback, even
+        though the steady-state PTP residual is excellent (<2 ms).
+
+        For a single receiver, multi-room sync isn't required and stable
+        playback matters more than absolute master-domain alignment — so we
+        use local monotonic time here. The PTP slave still runs and is
+        available for diagnostic reporting and future multi-room work via
+        self._ensure_ptp_clock()."""
+        return time.monotonic_ns()
 
     def _wait_for_ptp_sync(self, timeout_sec: float = 1.5) -> bool:
-        """Block briefly for the PTP slave to acquire first lock. Returns
-        True if synced before the timeout, False otherwise. Used right
-        before capturing the play-start anchor so the anchor lands in
-        master domain when possible."""
+        """Log current PTP status (no longer blocks playback).
+
+        Kept as a hook for future multi-room work where we'd want to wait
+        for cross-receiver clock agreement before starting playback. For
+        the single-receiver case the audio scheduler uses local monotonic
+        time, so blocking here just adds startup latency without benefit.
+        """
         clk = self._ensure_ptp_clock()
         if clk is None:
             return False
         if clk.is_synced():
+            self.audio_screen_logger.debug(
+                f"PTP at playback start: offset={clk.get_offset_ns()/1e6:+.3f}ms "
+                f"mpd={clk.get_mean_path_delay_ns()/1e6:.3f}ms"
+            )
             return True
-        deadline = time.monotonic() + timeout_sec
-        while time.monotonic() < deadline:
-            if clk.is_synced():
-                self.audio_screen_logger.info(
-                    f"PTP locked before playback: offset={clk.get_offset_ns()/1e6:+.3f}ms "
-                    f"mpd={clk.get_mean_path_delay_ns()/1e6:.3f}ms"
-                )
-                return True
-            time.sleep(0.05)
-        self.audio_screen_logger.warning(
-            "PTP did not acquire lock in time; anchoring with local clock "
-            "(playback will be coarsely synced until lock arrives)"
-        )
         return False
 
     def decrypt(self, rtp):
@@ -758,6 +758,11 @@ class AudioRealtime(Audio):
         self.port = self.socket.getsockname()[1]
         self.rtp_buffer = RTPRealtimeBuffer(buff_size, self.isDebug)
         self.anchorRTPTimestamp = None
+        # seq_no -> last-requested monotonic_ns. Used to suppress the
+        # resend-storm in serve(): without this we re-issue REXMIT_REQUEST
+        # for the same missing seq on every RTCP cycle, flooding the
+        # sender's control port and producing 2 s playback hiccups on Wi-Fi.
+        self._resend_pending_ns = {}
 
     def fini_audio_sink(self):
         self.sink.close()
@@ -786,16 +791,27 @@ class AudioRealtime(Audio):
                     """
 
             if self.rtp_buffer.gaps_exist():
+                now_ns = time.monotonic_ns()
+                # Re-request the same seq at most every 250 ms — gives the
+                # sender time to actually answer the previous request.
+                cooldown_ns = 250_000_000
+                # Garbage-collect tracking entries older than 2 s
+                self._resend_pending_ns = {
+                    s: t for s, t in self._resend_pending_ns.items()
+                    if (now_ns - t) < 2_000_000_000
+                }
                 for missing_seq in self.rtp_buffer.missing_sequence_nos():
                     # Each missing_seq is a tuple: (Seq#, amount_following)
+                    seq = missing_seq[0]
+                    last = self._resend_pending_ns.get(seq, 0)
+                    if (now_ns - last) < cooldown_ns:
+                        continue
+                    self._resend_pending_ns[seq] = now_ns
                     self.audio_screen_logger.debug(
-                        f'requesting resend of sequence_no {missing_seq[0]}; amt {missing_seq[1]}'
+                        f'requesting resend of sequence_no {seq}; amt {missing_seq[1]}'
                     )
-                    # request resend via control channel here
-                    """ syntax:
-                    resend_{missing_seq_no_start}/{amount_following}/{optional_timestamp}
-                    """
-                    control_send.put(f'resend_{missing_seq[0]}/{missing_seq[1]}/{0}')
+                    # syntax: resend_{missing_seq_no_start}/{amount_following}/{optional_timestamp}
+                    control_send.put(f'resend_{seq}/{missing_seq[1]}/{0}')
 
             # Wake every ~fifth packet
             time.sleep((self.spf / self.sample_rate) * 5)
