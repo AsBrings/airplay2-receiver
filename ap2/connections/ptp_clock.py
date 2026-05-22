@@ -100,16 +100,20 @@ class PTPDisciplinedClock:
         master_time(t) = offset + (t - sync_local) * (1 + freq_ppb*1e-9) + sync_local
                        = t + offset + (t - sync_local) * freq_ppb*1e-9
 
-        When unsynced, returns the local time unchanged (caller can check
-        get_status to decide whether to wait).
+        When unsynced, returns the local time unchanged. Caller can check
+        get_status() to decide whether to wait.
         """
         if local_ns is None:
             local_ns = now_local_ns()
+        # Use the explicit status field — a legitimate sync can land at
+        # offset==0 and freq_ppb==0 (loopback self-test, or two clocks
+        # genuinely in agreement) and we'd still want to apply discipline
+        # (here a no-op, but the status check correctly says "we're synced").
+        if int(self._arr[5]) < self.STATUS_SYNCED:
+            return local_ns
         offset = self._arr[0]
         freq_ppb = self._arr[1]
         sync_local = self._arr[2]
-        if offset == 0.0 and freq_ppb == 0.0:
-            return local_ns
         elapsed = local_ns - sync_local
         drift = elapsed * freq_ppb * 1e-9
         return int(local_ns + offset + drift)

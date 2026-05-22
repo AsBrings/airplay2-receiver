@@ -812,6 +812,10 @@ class AP2Handler(http.server.BaseHTTPRequestHandler):
                 self.logger.info(self.pp.pformat(plist))
                 if plist == {} and len(self.server.streams) == 0:
                     self.server.event_proc.terminate()
+                    # Release the PTP slave too — otherwise it keeps the
+                    # UDP/319 + UDP/320 ports bound and keeps sending
+                    # Delay_Req to a sender that has already gone away.
+                    self._stop_ptp_slave()
         self.send_response(200)
         self.send_header("Server", self.version_string())
         self.send_header("CSeq", self.headers["CSeq"])
@@ -839,7 +843,13 @@ class AP2Handler(http.server.BaseHTTPRequestHandler):
             plist = readPlistFromString(body)
             self.logger.info(self.pp.pformat(plist))
             if isinstance(plist, list):
-                ips = [str(x) for x in plist if isinstance(x, (str, bytes))]
+                # PTPSlave binds AF_INET sockets and sendto()s the master's
+                # IP — feeding an IPv6 (e.g. fe80::...) into that call
+                # raises immediately. Filter to dotted-quad IPv4 only.
+                ips = [
+                    str(x) for x in plist
+                    if isinstance(x, (str, bytes)) and str(x).count(".") == 3
+                ]
                 self._maybe_start_ptp_slave(ips, master_clock_identity=None)
         self.send_response(200)
         self.send_header("Server", self.version_string())
@@ -935,6 +945,21 @@ class AP2Handler(http.server.BaseHTTPRequestHandler):
             f"PTP slave spawned: master_ips={ips} "
             f"clockID={master_clock_identity.hex() if master_clock_identity else 'unknown'}"
         )
+
+    def _stop_ptp_slave(self):
+        """Tear down the PTP slave process and release its UDP ports."""
+        proc = getattr(self.server, "ptp_proc", None)
+        if proc and proc.is_alive():
+            try:
+                proc.terminate()
+                proc.join(timeout=1.0)
+            except Exception:  # noqa: BLE001
+                pass
+        self.server.ptp_proc = None
+        self.server.ptp_master_key = None
+        # ptp_clock_array is reused across sessions — don't drop it,
+        # only the wrapper view if held.
+        self.server.ptp_clock = None
 
     def do_FLUSH(self):
         self.logger.info(f'{self.command}: {self.path}')

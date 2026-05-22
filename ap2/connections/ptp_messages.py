@@ -106,25 +106,6 @@ class PtpHeader:
     control_field: int = 0
     log_message_interval: int = 0      # int8
 
-    def pack(self) -> bytes:
-        b0 = ((self.transport_specific & 0x0F) << 4) | (self.message_type & 0x0F)
-        b1 = self.version & 0x0F
-        correction_scaled = (self.correction_ns & 0xFFFFFFFFFFFFFFFF) << 16
-        # In real PTP correction is a 64-bit signed scaled ns; for tx we just
-        # send zero. For rx we decode to ns by dropping the low 16b.
-        return struct.pack(
-            "!BBHBBHq4xB",  # 4 reserved bytes after correction (placeholder for now)
-            b0, b1,
-            self.message_length, self.domain_number, 0,  # reserved byte 5
-            self.flags,
-            correction_scaled,
-            # 4 reserved bytes accounted for by '4x'
-            self.control_field,
-        ) + self.source_port_identity.pack() + struct.pack(
-            "!Hb", self.sequence_id, self.log_message_interval
-        )
-        # NOTE: layout differs from this struct call — see pack_header_bytes below.
-
     @classmethod
     def unpack(cls, buf: bytes) -> "PtpHeader":
         if len(buf) < PTP_HEADER_LEN:

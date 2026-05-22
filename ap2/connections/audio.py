@@ -523,7 +523,10 @@ class Audio:
 
         self.resampler = av.AudioResampler(
             format=av.AudioFormat('s' + str(self.sample_size)).packed,
-            layout='stereo',
+            # Must match channel_count: PyAudio's sink was opened with
+            # channels=self.channel_count, so up/down-mixing here would
+            # produce a size mismatch when we write the bytes back.
+            layout='mono' if self.channel_count == 1 else 'stereo',
             rate=self.sample_rate,
         )
 
@@ -556,19 +559,19 @@ class Audio:
         return 0.002
 
     def _ptp_now_ns(self) -> int:
-        """Time source for the audio scheduler.
+        """Wall-clock source for the audio playback scheduler.
 
-        Originally returned the PTP-disciplined master time. In practice, on
-        Wi-Fi the disciplined clock occasionally steps (>100 ms) when the
-        servo sees outlier Sync samples; that step propagates into
-        msec_to_playout and stalls / desyncs single-receiver playback, even
-        though the steady-state PTP residual is excellent (<2 ms).
+        Returns local monotonic ns — *not* the PTP-disciplined clock. PTP
+        re-steps (which can be >100 ms on Wi-Fi when the servo sees outlier
+        Sync samples) would otherwise propagate into msec_to_playout and
+        stall single-receiver playback, even though steady-state PTP
+        residual is <2 ms.
 
-        For a single receiver, multi-room sync isn't required and stable
-        playback matters more than absolute master-domain alignment — so we
-        use local monotonic time here. The PTP slave still runs and is
-        available for diagnostic reporting and future multi-room work via
-        self._ensure_ptp_clock()."""
+        Multi-room sync (the legitimate use case for feeding disciplined
+        time into the scheduler) needs outlier rejection + slow-slew in
+        the servo before this can switch back; until then the PTP slave
+        keeps running but is read-only via self._ensure_ptp_clock() for
+        diagnostics."""
         return time.monotonic_ns()
 
     def _wait_for_ptp_sync(self, timeout_sec: float = 1.5) -> bool:
@@ -642,15 +645,14 @@ class Audio:
                         if not out:
                             continue
                         out = out[0]
-                    # PyAV >= 14 may return planar layouts even when the
-                    # resampler is asked for a packed format; planes[0] would
-                    # then contain only channel 0, which PyAudio plays at the
-                    # wrong pitch with stereo gaps. Use to_ndarray() and
-                    # explicitly interleave so we always hand back packed
-                    # PCM regardless of the underlying frame layout.
+                    # Always produce packed interleaved PCM. PyAV's
+                    # `frame.format.is_planar` is the authoritative flag —
+                    # avoid shape heuristics (packed audio happens to come
+                    # back as (1, N*ch) in current PyAV, but that's an
+                    # implementation detail we shouldn't rely on).
                     arr = out.to_ndarray()
-                    if arr.ndim == 2 and arr.shape[0] > 1:
-                        # planar (channels, samples) -> interleaved
+                    if out.format.is_planar and arr.ndim == 2:
+                        # (channels, samples) -> interleaved
                         arr = arr.T.reshape(-1)
                     return arr.tobytes()
             except ValueError as e:
